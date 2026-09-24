@@ -217,7 +217,9 @@ def kalshi_quote(m: dict, ev: dict | None = None) -> Quote | None:
         no_ask=no_ask,
         # Kalshi's list endpoint gives size at the best YES ask; NO-ask size would need the order book
         yes_ask_size=num(m.get("yes_ask_size_fp")),
-        url=f"https://kalshi.com/markets/{event.split('-')[0].lower()}" if event else "https://kalshi.com",
+        # Kalshi event pages live at kalshi.com/markets/<series>/-/<event ticker>
+        url=(f"https://kalshi.com/markets/{event.split('-')[0].lower()}/-/{event.lower()}"
+             if event else "https://kalshi.com"),
         sides=[yes_label, m.get("no_sub_title") or ""],
         base=title,
     )
@@ -242,6 +244,43 @@ def fetch_poly() -> list[Quote]:
         offset += limit
         time.sleep(1.1)  # public API allows ~60 requests/minute
     return out
+
+
+_POLY_EVENT_SLUGS: dict[str, str] | None = None
+
+
+def poly_event_url(market_slug: str) -> str:
+    """
+    Polymarket US pages are per *event* (polymarket.us/event/<event slug>), and the
+    markets list doesn't say which event a market belongs to. So the first time we
+    need a link, pull the events list once and map market slug -> event slug.
+    Only runs when there's an alert to send.
+    """
+    global _POLY_EVENT_SLUGS
+    if _POLY_EVENT_SLUGS is None:
+        _POLY_EVENT_SLUGS = {}
+        try:
+            offset = 0
+            while offset <= 20000:
+                data = get_json(f"{POLY_BASE}/v1/events",
+                                {"limit": 200, "offset": offset, "active": "true", "closed": "false"})
+                events = data.get("events", []) if isinstance(data, dict) else data
+                for ev in events:
+                    for m in ev.get("markets") or []:
+                        if m.get("slug") and ev.get("slug"):
+                            _POLY_EVENT_SLUGS[m["slug"]] = ev["slug"]
+                if len(events) < 200:
+                    break
+                offset += 200
+                time.sleep(1.1)
+        except Exception as e:  # links are a nice-to-have; never block the alert
+            print(f"  couldn't load Polymarket event list: {e}")
+    slug = _POLY_EVENT_SLUGS.get(market_slug)
+    if not slug:
+        # Fallback: "tec-mlb-champ-2026-09-27-atl" -> "mlb-champ-2026-09-27"
+        hit = re.match(r"^[a-z]+-(.+?\d{4}-\d{2}-\d{2})", market_slug)
+        slug = hit.group(1) if hit else market_slug
+    return f"https://polymarket.us/event/{slug}"
 
 
 def side_label(side: dict) -> str:
@@ -512,13 +551,17 @@ def save_state(state: dict):
         json.dump(state, f)
 
 
-def send(title: str, body: str, url: str = "", priority: str = "default"):
+def send(title: str, body: str, url: str = "", priority: str = "default", poly_url: str = ""):
     if DRY_RUN or not NTFY_TOPIC:
         print(f"\n[ALERT] {title}\n{body}\n")
         return
     headers = {"Title": title.encode("utf-8"), "Priority": priority, "Tags": "moneybag"}
     if url:
         headers["Click"] = url
+        actions = [f"view, Kalshi, {url}"]
+        if poly_url:
+            actions.append(f"view, Polymarket, {poly_url}")
+        headers["Actions"] = "; ".join(actions)
     try:
         requests.post(f"https://ntfy.sh/{NTFY_TOPIC}", data=body.encode("utf-8"),
                       headers=headers, timeout=15).raise_for_status()
@@ -559,7 +602,10 @@ def format_opp(o: Opp) -> tuple[str, str]:
         f"{o.p.id}\n"
         f"\n"
         f"Title match: {o.score:.0f}%\n"
-        f"Check both rulebooks match before trading."
+        f"Check both rulebooks match before trading.\n"
+        f"\n"
+        f"Kalshi: {o.k.url}\n"
+        f"Polymarket: {o.p.url}"
     )
     return title, body
 
@@ -670,8 +716,9 @@ def main():
         # re-alert only if the edge improved by at least 1 cent
         if prev and o.edge < prev["edge"] + 0.01:
             continue
+        o.p.url = poly_event_url(o.p.id)
         title, body = format_opp(o)
-        send(title, body, o.p.url, "high" if o.edge >= 0.03 else "default")
+        send(title, body, o.k.url, "high" if o.edge >= 0.03 else "default", o.p.url)
         state[o.key] = {"edge": o.edge, "t": time.time()}
         sent += 1
 
