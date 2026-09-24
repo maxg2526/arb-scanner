@@ -170,8 +170,16 @@ DRAW_WORDS = {"tie", "draw", "tie game"}
 
 
 def is_kalshi_game(ev: dict) -> bool:
-    # Single-game series look like KXNFLGAME, KXMLBGAME, KXNCAAFGAME (not KXGAMEAWARDS)
-    return bool(re.search(r"GAME$", ev.get("series_ticker") or ""))
+    """
+    Head-to-head events: team games (KXNFLGAME, KXMLBGAME...) and fights (UFC, boxing).
+    Recognised by the series name, or by a "A vs B" title with 2-3 outcome markets.
+    """
+    series = ev.get("series_ticker") or ""
+    if re.search(r"(GAME|FIGHT|BOUT|MATCH)$", series):
+        return True
+    title = f"{ev.get('title') or ''} {ev.get('sub_title') or ''}"
+    n = len(ev.get("markets") or [])
+    return 2 <= n <= 3 and bool(re.search(r"\bvs\.?\b", title, re.I))
 
 
 def kalshi_teams(ev: dict) -> list[str]:
@@ -571,6 +579,13 @@ def print_samples():
         return t is not None and (t - now).total_seconds() < days * 86400
 
     games = [e for e in KALSHI_SAMPLES if is_kalshi_game(e)]
+    fights = [e for e in games if re.search("UFC|MMA|BOX|FIGHT", e.get("series_ticker") or "")]
+    print(f"\n-- Kalshi fight events ({len(fights)}) --")
+    for e in fights[:8]:
+        print(f"  {e.get('event_ticker')} | {e.get('title')!r} | sub={e.get('sub_title')!r}")
+        for m in (e.get("markets") or [])[:2]:
+            print(f"      {m.get('ticker')} yes={m.get('yes_sub_title')!r} ask={m.get('yes_ask_dollars')} "
+                  f"exp={m.get('expected_expiration_time')}")
     print(f"\nKalshi game series: {dict(Counter(e.get('series_ticker') for e in games).most_common(20))}")
     print(f"\n-- Kalshi game events ({len(games)}) --")
     for e in games[:12]:
