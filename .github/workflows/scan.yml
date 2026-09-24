@@ -39,6 +39,8 @@ jobs:
       - name: Scan
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NOVIG_KEY_ID: ${{ secrets.NOVIG_KEY_ID }}
+          NOVIG_PRIVATE_KEY: ${{ secrets.NOVIG_PRIVATE_KEY }}
           TEST_ALERT: ${{ inputs.test_alert && '1' || '0' }}
           MIN_EDGE: "0.01"
           MAX_EDGE: "0.08"
