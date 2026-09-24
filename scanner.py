@@ -129,6 +129,7 @@ class Quote:
     no_ask_size: float | None = None
     url: str = ""
     sides: list[str] = field(default_factory=list)  # [YES label, NO label] if known
+    base: str = ""        # title without the outcome label appended
 
 
 # ---------------------------------------------------------------- Kalshi
@@ -184,6 +185,7 @@ def kalshi_quote(m: dict, ev: dict | None = None) -> Quote | None:
         yes_ask_size=num(m.get("yes_ask_size_fp")),
         url=f"https://kalshi.com/markets/{event.split('-')[0].lower()}" if event else "https://kalshi.com",
         sides=[yes_label, m.get("no_sub_title") or ""],
+        base=title,
     )
 
 
@@ -219,6 +221,16 @@ def side_label(side: dict) -> str:
     return ""
 
 
+def poly_title(m: dict, slug: str) -> str:
+    """Join question/title/subtitle, skipping repeats. The question alone is often generic."""
+    parts = []
+    for k in ("question", "title", "subtitle", "titleShort"):
+        v = m.get(k)
+        if isinstance(v, str) and v.strip() and norm(v) not in [norm(x) for x in parts]:
+            parts.append(v.strip())
+    return " | ".join(parts) or slug
+
+
 def poly_quote(m: dict) -> Quote | None:
     status = str(m.get("status", "")).upper()
     if status and "OPEN" not in status:
@@ -249,7 +261,7 @@ def poly_quote(m: dict) -> Quote | None:
     return Quote(
         platform="Polymarket US",
         id=slug,
-        title=m.get("question") or m.get("title") or slug,
+        title=poly_title(m, slug),
         close=parse_time(m.get("endDate")),
         yes_ask=yes_ask,
         no_ask=no_ask,
@@ -278,6 +290,22 @@ def orientation(k: Quote, p: Quote) -> int:
     if s_no >= 80 and s_no > s_yes + 15:
         return -1
     return 0
+
+
+GENERIC_LABELS = {"", "yes", "no"}
+
+
+def outcome_agrees(k: Quote, p: Quote, p_text: str) -> bool:
+    """
+    Kalshi often has one market per outcome under a shared event title
+    (e.g. "Undefeated season" -> Notre Dame / Miami / Texas ...). Matching the
+    event title isn't enough: the specific outcome (team, player, threshold)
+    must also appear in the Polymarket market, or it's a different bet.
+    """
+    label = norm(k.sides[0] if k.sides else "")
+    if label in GENERIC_LABELS or (k.base and label in norm(k.base)):
+        return True
+    return fuzz.partial_ratio(label, p_text) >= 90
 
 
 def similarity(a: str, b: str, **kwargs) -> float:
@@ -318,7 +346,7 @@ def match(kalshi: list[Quote], poly: list[Quote]):
                                       scorer=similarity, score_cutoff=MIN_MATCH_SCORE)
             cache[ck] = (best[2], best[1]) if best else None
         hit = cache[ck]
-        if hit:
+        if hit and outcome_agrees(k, poly[hit[0]], names[hit[0]]):
             yield k, poly[hit[0]], hit[1]
 
 
@@ -428,30 +456,42 @@ def format_opp(o: Opp) -> tuple[str, str]:
 
 def print_samples():
     from collections import Counter
+    now = datetime.now(timezone.utc)
     print("\n================ SAMPLE DATA (manual runs only) ================")
-    cats = Counter((e.get("category") or "?") for e in KALSHI_SAMPLES)
-    print("Kalshi categories in sample:", dict(cats.most_common(12)))
-    sports = [e for e in KALSHI_SAMPLES if (e.get("category") or "").lower() == "sports"]
-    print("\n-- Kalshi sports events --")
-    for e in sports[:15]:
-        mk = (e.get("markets") or [])[:2]
-        print(f"  {e.get('event_ticker')} | {e.get('title')!r} | sub={e.get('sub_title')!r}")
-        for m in mk:
-            print(f"      {m.get('ticker')} yes={m.get('yes_sub_title')!r} "
-                  f"close={m.get('close_time')} exp={m.get('expected_expiration_time')}")
+    series = Counter((e.get("series_ticker") or "?") for e in KALSHI_SAMPLES
+                     if (e.get("category") or "").lower() == "sports")
+    print("Kalshi sports series in sample:", dict(series.most_common(25)))
 
-    pcats = Counter(str(m.get("category")) for m in POLY_SAMPLES)
-    print("\nPolymarket US categories:", dict(pcats.most_common(12)))
-    if POLY_SAMPLES:
-        print("Polymarket US market fields:", sorted(POLY_SAMPLES[0].keys()))
-    psports = [m for m in POLY_SAMPLES if "sport" in str(m.get("category")).lower()] or POLY_SAMPLES
-    print("\n-- Polymarket US sports markets --")
-    for m in psports[:15]:
-        sides = [{k: v for k, v in sd.items() if not isinstance(v, (dict, list))}
+    def soon(ts, days=10):
+        t = parse_time(ts)
+        return t is not None and (t - now).total_seconds() < days * 86400
+
+    games = [e for e in KALSHI_SAMPLES if (e.get("category") or "").lower() == "sports"
+             and any(soon(m.get("expected_expiration_time") or m.get("close_time"))
+                     for m in e.get("markets") or [])]
+    print(f"\n-- Kalshi sports events settling within 10 days ({len(games)}) --")
+    for e in games[:20]:
+        print(f"  {e.get('event_ticker')} | {e.get('title')!r} | sub={e.get('sub_title')!r}")
+        for m in (e.get("markets") or [])[:3]:
+            print(f"      {m.get('ticker')} yes={m.get('yes_sub_title')!r} "
+                  f"ask={m.get('yes_ask_dollars')} exp={m.get('expected_expiration_time')}")
+
+    types = Counter(str(m.get("sportsMarketTypeV2") or m.get("sportsMarketType")) for m in POLY_SAMPLES)
+    print("\nPolymarket US sports market types:", dict(types.most_common(15)))
+    pgames = [m for m in POLY_SAMPLES if m.get("gameStartTime")]
+    print(f"\n-- Polymarket US markets with a game start time ({len(pgames)}) --")
+    for m in pgames[:20]:
+        sides = [(sd.get("description"), sd.get("long"), sd.get("teamId"))
                  for sd in (m.get("marketSides") or []) if isinstance(sd, dict)]
-        print(f"  {m.get('slug')} | q={m.get('question')!r} | end={m.get('endDate')} "
-              f"| bid={m.get('bestBidQuote')} ask={m.get('bestAskQuote')}")
-        print(f"      sides={json.dumps(sides)[:400]}")
+        print(f"  {m.get('slug')} | type={m.get('sportsMarketTypeV2') or m.get('sportsMarketType')}")
+        print(f"      q={m.get('question')!r} title={m.get('title')!r} sub={m.get('subtitle')!r} "
+              f"short={m.get('titleShort')!r}")
+        print(f"      start={m.get('gameStartTime')} end={m.get('endDate')} outcomes={m.get('outcomes')} "
+              f"sides={sides} bid={num(m.get('bestBidQuote'))} ask={num(m.get('bestAskQuote'))}")
+    print("\n-- Polymarket US non-sports examples --")
+    for m in [m for m in POLY_SAMPLES if m.get("category") != "sports"][:10]:
+        print(f"  {m.get('slug')} | q={m.get('question')!r} title={m.get('title')!r} "
+              f"sub={m.get('subtitle')!r} end={m.get('endDate')}")
     print("================================================================\n")
 
 
