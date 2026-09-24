@@ -49,6 +49,8 @@ MAX_EDGE = float(os.getenv("MAX_EDGE", "0.08"))
 MIN_MATCH_SCORE = float(os.getenv("MIN_MATCH_SCORE", "85"))
 MAX_DAYS_APART = float(os.getenv("MAX_DAYS_APART", "3"))
 MIN_SIZE = float(os.getenv("MIN_SIZE", "10"))
+# Your usual trade size in dollars -- alerts show how many contracts per side this buys.
+BUDGET = float(os.getenv("BUDGET", "100"))
 STATE_FILE = os.getenv("STATE_FILE", "state/alerted.json")
 NTFY_TOPIC = os.getenv("NTFY_TOPIC", "").strip()
 DRY_RUN = os.getenv("DRY_RUN") == "1"
@@ -496,6 +498,8 @@ class Opp:
     fees: float
     edge: float
     days: float | None
+    k_size: float | None = None   # contracts available at the quoted Kalshi price
+    p_size: float | None = None   # contracts available at the quoted Polymarket price
 
     @property
     def annualized(self) -> float | None:
@@ -529,7 +533,8 @@ def price_pair(k: Quote, p: Quote, score: float, orient: int | None = None) -> l
         cost = kp + pp
         edge = 1 - cost - fees
         opps.append(Opp(f"{k.id}|{p.id}|{k_side}", k, p, score, k_side, p_side,
-                        kp, pp, cost, fees, edge, days))
+                        kp, pp, cost, fees, edge, days,
+                        k_size=k.yes_ask_size if k_side == "YES" else None))
     return opps
 
 
@@ -576,6 +581,50 @@ def side_text(side: str, subject: str) -> str:
     return side
 
 
+def fmt_count(x: float | None, approx: bool = False) -> str:
+    if x is None:
+        return "unknown"
+    return f"{'~' if approx else ''}{int(x):,}"
+
+
+def size_lines(o: Opp) -> str:
+    """
+    Available: 340 on Kalshi, ~120 on Polymarket
+    Max size at these prices: 120 contracts (~$114 in, ~$2 profit)
+    $500 budget: 120 contracts each side (capped by available size)
+    """
+    per = o.cost + o.fees  # all-in cost of one contract on each side
+    lines = [f"Available: {fmt_count(o.k_size)} on Kalshi, "
+             f"{fmt_count(o.p_size, approx=True)} on Polymarket"]
+    known = [x for x in (o.k_size, o.p_size) if x is not None]
+    max_n = int(min(known)) if known else None
+    if max_n is not None:
+        lines.append(f"Max size at these prices: {max_n:,} contracts "
+                     f"(~${max_n * per:,.0f} in, ~${max_n * o.edge:,.2f} profit)")
+    want = int(BUDGET // per) if per > 0 else 0
+    if max_n is not None and max_n < want:
+        lines.append(f"${BUDGET:,.0f} budget: {max_n:,} contracts each side (capped by available size)")
+    else:
+        lines.append(f"${BUDGET:,.0f} budget: {want:,} contracts each side "
+                     f"(~${want * o.edge:,.2f} profit)")
+    return "\n".join(lines)
+
+
+def grade(o: Opp) -> str:
+    """
+    Letter grade from profit per contract (more is better) and days to payout (fewer is better).
+
+                       <= 7 days   8-60 days   > 60 days
+        3¢+ /contract      A           B           C
+        2-3¢               B           C           D
+        1-2¢               C           D           D
+    """
+    cents = o.edge * 100
+    r = 3 if cents >= 3 else 2 if cents >= 2 else 1
+    t = 3 if o.days is not None and o.days <= 7 else 2 if o.days is not None and o.days <= 60 else 1
+    return {6: "A", 5: "B", 4: "C"}.get(r + t, "D")
+
+
 def format_opp(o: Opp) -> tuple[str, str]:
     """
     Phone notification layout:
@@ -591,7 +640,7 @@ def format_opp(o: Opp) -> tuple[str, str]:
     ann = o.annualized
     ann_txt = f"{ann:.0%} / yr" if ann is not None and ann < 50 else "n/a / yr"
     days_txt = f"{o.days:.0f} days" if o.days is not None else "? days"
-    title = f"{o.edge * 100:.1f}¢ / contract | {ann_txt} | {days_txt}"
+    title = f"Grade {grade(o)} | {o.edge * 100:.1f}¢ / contract | {ann_txt} | {days_txt}"
     body = (
         f"{o.k.title}\n"
         f"\n"
@@ -600,6 +649,8 @@ def format_opp(o: Opp) -> tuple[str, str]:
         f"\n"
         f"Polymarket - {side_text(o.p_side, o.p.sides[0] if o.p.teams and o.p.sides else '')} - ${o.p_price:.2f}\n"
         f"{o.p.id}\n"
+        f"\n"
+        f"{size_lines(o)}\n"
         f"\n"
         f"Title match: {o.score:.0f}%\n"
         f"Check both rulebooks match before trading.\n"
@@ -723,12 +774,16 @@ def refresh(o: Opp) -> bool | None:
     try:
         km = get_json(f"{KALSHI_BASE}/markets/{o.k.id}", tries=2).get("market") or {}
         kp = num(km.get("yes_ask_dollars" if o.k_side == "YES" else "no_ask_dollars"))
+        # Buying NO on Kalshi fills against YES bids, so NO size = size at the best YES bid
+        o.k_size = num(km.get("yes_ask_size_fp" if o.k_side == "YES" else "yes_bid_size_fp"))
         bbo = get_json(f"{POLY_BASE}/v1/markets/{o.p.id}/bbo", tries=2).get("marketData") or {}
         if o.p_side == "YES":
             pp = num(bbo.get("bestAsk"))
+            o.p_size = num(bbo.get("askShares"))
         else:
             bid = num(bbo.get("bestBid"))
             pp = 1 - bid if bid else None
+            o.p_size = num(bbo.get("bidShares"))  # buying NO = selling into YES bids
     except Exception as e:
         print(f"  recheck failed for {o.k.id}: {e}")
         return None
