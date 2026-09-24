@@ -1,0 +1,56 @@
+name: Arb scan
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # every 5 minutes (GitHub sometimes runs these a few minutes late)
+  workflow_dispatch:         # lets you press "Run workflow" by hand
+    inputs:
+      test_alert:
+        description: "Only send a test notification to my phone"
+        type: boolean
+        default: false
+
+concurrency:
+  group: arb-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # Remembers which opportunities were already sent, so you don't get the same alert every 5 minutes
+      - name: Restore alert history
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: arb-state-${{ github.run_id }}
+          restore-keys: arb-state-
+
+      - name: Scan
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TEST_ALERT: ${{ inputs.test_alert && '1' || '0' }}
+          MIN_EDGE: "0.01"
+          MAX_EDGE: "0.08"
+          MIN_MATCH_SCORE: "85"
+          MAX_DAYS_APART: "3"
+        run: |
+          mkdir -p state && touch state/.keep
+          python scanner.py
+
+      - name: Save alert history
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: arb-state-${{ github.run_id }}
