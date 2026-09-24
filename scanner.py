@@ -52,6 +52,10 @@ MIN_SIZE = float(os.getenv("MIN_SIZE", "10"))
 STATE_FILE = os.getenv("STATE_FILE", "state/alerted.json")
 NTFY_TOPIC = os.getenv("NTFY_TOPIC", "").strip()
 DRY_RUN = os.getenv("DRY_RUN") == "1"
+# Manual runs ("Run workflow" button) also print sample raw data for tuning the matcher
+SAMPLE_MODE = os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch" or os.getenv("SAMPLES") == "1"
+KALSHI_SAMPLES: list[dict] = []
+POLY_SAMPLES: list[dict] = []
 
 session = requests.Session()
 session.headers["User-Agent"] = "arb-scanner/1.0"
@@ -130,25 +134,30 @@ class Quote:
 # ---------------------------------------------------------------- Kalshi
 
 def fetch_kalshi() -> list[Quote]:
+    """Pull open events with their markets, so each market gets the full event title."""
     out, cursor, pages = [], "", 0
     while True:
-        params = {"status": "open", "limit": 1000, "mve_filter": "exclude"}
+        params = {"status": "open", "limit": 200, "with_nested_markets": "true"}
         if cursor:
             params["cursor"] = cursor
-        data = get_json(f"{KALSHI_BASE}/markets", params)
-        for m in data.get("markets", []):
-            q = kalshi_quote(m)
-            if q:
-                out.append(q)
+        data = get_json(f"{KALSHI_BASE}/events", params)
+        for ev in data.get("events", []):
+            if SAMPLE_MODE and len(KALSHI_SAMPLES) < 400:
+                KALSHI_SAMPLES.append(ev)
+            for m in ev.get("markets") or []:
+                q = kalshi_quote(m, ev)
+                if q:
+                    out.append(q)
         cursor = data.get("cursor") or ""
         pages += 1
-        print(f"  page {pages}: {len(out)} priced so far", flush=True)
-        if not cursor or pages >= 60:
+        if pages % 10 == 0:
+            print(f"  page {pages}: {len(out)} priced so far", flush=True)
+        if not cursor or pages >= 500:
             break
     return out
 
 
-def kalshi_quote(m: dict) -> Quote | None:
+def kalshi_quote(m: dict, ev: dict | None = None) -> Quote | None:
     if m.get("market_type", "binary") != "binary":
         return None
     yes_ask = num(m.get("yes_ask_dollars"))
@@ -158,7 +167,8 @@ def kalshi_quote(m: dict) -> Quote | None:
     no_ask = no_ask if no_ask and 0 < no_ask < 1 else None
     if yes_ask is None and no_ask is None:
         return None
-    title = m.get("title") or ""
+    ev = ev or {}
+    title = " ".join(x for x in (ev.get("title"), ev.get("sub_title")) if x) or m.get("title") or ""
     yes_label = m.get("yes_sub_title") or ""
     full = f"{title} {yes_label}".strip() if yes_label and yes_label.lower() not in title.lower() else title
     close = parse_time(m.get("expected_expiration_time")) or parse_time(m.get("close_time"))
@@ -186,6 +196,8 @@ def fetch_poly() -> list[Quote]:
                         {"limit": limit, "offset": offset, "active": "true", "closed": "false"})
         markets = data.get("markets", []) if isinstance(data, dict) else data
         for m in markets:
+            if SAMPLE_MODE and len(POLY_SAMPLES) < 3000:
+                POLY_SAMPLES.append(m)
             q = poly_quote(m)
             if q:
                 out.append(q)
@@ -268,6 +280,15 @@ def orientation(k: Quote, p: Quote) -> int:
     return 0
 
 
+def similarity(a: str, b: str, **kwargs) -> float:
+    """
+    Average of two fuzzy scores. token_set alone gives 100 whenever one title's
+    words are a subset of the other ("sweden" vs "prime minister of sweden..."),
+    so we blend in token_sort, which punishes big length differences.
+    """
+    return (fuzz.token_set_ratio(a, b) + fuzz.token_sort_ratio(a, b)) / 2
+
+
 def match(kalshi: list[Quote], poly: list[Quote]):
     import bisect
     names = [norm(p.title + " " + " ".join(p.sides)) for p in poly]
@@ -294,7 +315,7 @@ def match(kalshi: list[Quote], poly: list[Quote]):
         ck = (norm(k.title), idx[0], idx[-1], len(idx))
         if ck not in cache:
             best = process.extractOne(ck[0], {i: names[i] for i in idx},
-                                      scorer=fuzz.token_set_ratio, score_cutoff=MIN_MATCH_SCORE)
+                                      scorer=similarity, score_cutoff=MIN_MATCH_SCORE)
             cache[ck] = (best[2], best[1]) if best else None
         hit = cache[ck]
         if hit:
@@ -403,6 +424,37 @@ def format_opp(o: Opp) -> tuple[str, str]:
     return title, body
 
 
+# ---------------------------------------------------------------- samples
+
+def print_samples():
+    from collections import Counter
+    print("\n================ SAMPLE DATA (manual runs only) ================")
+    cats = Counter((e.get("category") or "?") for e in KALSHI_SAMPLES)
+    print("Kalshi categories in sample:", dict(cats.most_common(12)))
+    sports = [e for e in KALSHI_SAMPLES if (e.get("category") or "").lower() == "sports"]
+    print("\n-- Kalshi sports events --")
+    for e in sports[:15]:
+        mk = (e.get("markets") or [])[:2]
+        print(f"  {e.get('event_ticker')} | {e.get('title')!r} | sub={e.get('sub_title')!r}")
+        for m in mk:
+            print(f"      {m.get('ticker')} yes={m.get('yes_sub_title')!r} "
+                  f"close={m.get('close_time')} exp={m.get('expected_expiration_time')}")
+
+    pcats = Counter(str(m.get("category")) for m in POLY_SAMPLES)
+    print("\nPolymarket US categories:", dict(pcats.most_common(12)))
+    if POLY_SAMPLES:
+        print("Polymarket US market fields:", sorted(POLY_SAMPLES[0].keys()))
+    psports = [m for m in POLY_SAMPLES if "sport" in str(m.get("category")).lower()] or POLY_SAMPLES
+    print("\n-- Polymarket US sports markets --")
+    for m in psports[:15]:
+        sides = [{k: v for k, v in sd.items() if not isinstance(v, (dict, list))}
+                 for sd in (m.get("marketSides") or []) if isinstance(sd, dict)]
+        print(f"  {m.get('slug')} | q={m.get('question')!r} | end={m.get('endDate')} "
+              f"| bid={m.get('bestBidQuote')} ask={m.get('bestAskQuote')}")
+        print(f"      sides={json.dumps(sides)[:400]}")
+    print("================================================================\n")
+
+
 # ---------------------------------------------------------------- main
 
 def main():
@@ -419,6 +471,9 @@ def main():
     print("Fetching Polymarket US...")
     poly = fetch_poly()
     print(f"  {len(poly)} priced Polymarket US markets")
+
+    if SAMPLE_MODE:
+        print_samples()
 
     pairs = list(match(kalshi, poly))
     print(f"Matched {len(pairs)} candidate pairs")
