@@ -144,6 +144,7 @@ class Quote:
     game_time: datetime | None = None
     drawable: bool = False  # soccer-style: YES = one named team wins, a draw is possible
     fee_coef: float = KALSHI_FEE_COEF
+    sport: str = ""       # "football", "baseball", "mma"... blank if unknown
     extra: dict = field(default_factory=dict)  # platform-specific ids for live rechecks
 
 
@@ -167,6 +168,7 @@ def fetch_kalshi() -> list[Quote]:
                 if q:
                     if len(teams) == 2:
                         q.teams, q.game_time = teams, q.close
+                        q.sport = sport_of(ev.get("series_ticker") or "")
                     out.append(q)
         cursor = data.get("cursor") or ""
         pages += 1
@@ -178,6 +180,34 @@ def fetch_kalshi() -> list[Quote]:
 
 
 DRAW_WORDS = {"tie", "draw", "tie game"}
+
+
+SPORT_CODES = [  # (substring in a series ticker / slug / question, sport)
+    ("NCAAF", "football"), ("NFL", "football"), ("CFB", "football"),
+    ("MLB", "baseball"), ("NPB", "baseball"), ("KBO", "baseball"),
+    ("WNBA", "basketball"), ("NBA", "basketball"), ("NCAAMB", "basketball"), ("NCAAWB", "basketball"),
+    ("NCAAB", "basketball"), ("BBL", "basketball"), ("LNBP", "basketball"), ("ARGNACB", "basketball"),
+    ("NHL", "hockey"), ("KHL", "hockey"), ("UFC", "mma"), ("MMA", "mma"), ("BOXING", "boxing"),
+    ("CS2", "esports"), ("LOL", "esports"), ("DOTA", "esports"), ("R6", "esports"), ("VALORANT", "esports"),
+    ("EPL", "soccer"), ("UEFA", "soccer"), ("UECL", "soccer"), ("UCL", "soccer"), ("MLS", "soccer"),
+    ("USL", "soccer"), ("SERIE", "soccer"), ("LALIGA", "soccer"), ("BUNDES", "soccer"), ("LIGUE", "soccer"),
+    ("BRASILEIRO", "soccer"), ("AFCON", "soccer"), ("CONCACAF", "soccer"), ("FRIENDLY", "soccer"),
+    ("ENGNL", "soccer"), ("SOCCER", "soccer"), ("TENNIS", "tennis"), ("ATP", "tennis"), ("WTA", "tennis"),
+]
+QUESTION_SPORTS = {"mma event": "mma", "football event": "football", "boxing": "boxing",
+                   "baseball": "baseball", "basketball": "basketball", "hockey": "hockey"}
+
+
+def sport_of(code: str, text: str = "") -> str:
+    code = (code or "").upper()
+    for key, sport in SPORT_CODES:
+        if key in code:
+            return sport
+    low = (text or "").lower()
+    for key, sport in QUESTION_SPORTS.items():
+        if key in low:
+            return sport
+    return ""
 
 
 def is_kalshi_game(ev: dict) -> bool:
@@ -366,6 +396,8 @@ def poly_quote(m: dict) -> Quote | None:
             q.sides = [hit.group(1), f"not {hit.group(1)}"]
     if q.game_time:
         q.close = q.game_time + timedelta(hours=4)  # pays out right after the game, not at endDate
+        parts = slug.split("-")
+        q.sport = sport_of(parts[1] if len(parts) > 1 else "", m.get("question") or "")
     return q
 
 
@@ -490,6 +522,7 @@ def fetch_novig() -> list[Quote]:
             url="https://novig.com",
             sides=teams, teams=teams, game_time=start,
             fee_coef=coef,
+            sport=sport_of(str(m.get("league") or m.get("sport") or ""), str(m.get("sport") or "")),
             extra={"outcomes": [a, b]},
         ))
         time.sleep(0.03)  # stay well under Novig's 50 requests/second
@@ -567,6 +600,8 @@ def match_games(kalshi: list[Quote], poly: list[Quote]):
         best, best_score = None, 0.0
         for _, i in pg[lo:hi]:
             p = poly[i]
+            if k.sport and p.sport and k.sport != p.sport:
+                continue  # e.g. baseball "Lions" vs college-football "Lions"
             k1, k2 = k.teams
             p1, p2 = p.teams
             straight = min(team_score(k1, p1), team_score(k2, p2))
