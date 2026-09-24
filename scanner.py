@@ -142,6 +142,7 @@ def fetch_kalshi() -> list[Quote]:
                 out.append(q)
         cursor = data.get("cursor") or ""
         pages += 1
+        print(f"  page {pages}: {len(out)} priced so far", flush=True)
         if not cursor or pages >= 60:
             break
     return out
@@ -268,20 +269,36 @@ def orientation(k: Quote, p: Quote) -> int:
 
 
 def match(kalshi: list[Quote], poly: list[Quote]):
-    poly_names = [norm(p.title + " " + " ".join(p.sides)) for p in poly]
-    for k in kalshi:
-        # compare only against Polymarket markets closing within MAX_DAYS_APART
-        idx = [i for i, p in enumerate(poly)
-               if k.close is None or p.close is None
-               or abs((k.close - p.close).total_seconds()) <= MAX_DAYS_APART * 86400]
+    import bisect
+    names = [norm(p.title + " " + " ".join(p.sides)) for p in poly]
+    # Sort Polymarket markets by close time so each Kalshi market only compares
+    # against the handful closing within MAX_DAYS_APART (fast binary search).
+    dated = sorted((p.close.timestamp(), i) for i, p in enumerate(poly) if p.close)
+    times = [t for t, _ in dated]
+    undated = [i for i, p in enumerate(poly) if not p.close]
+    window = MAX_DAYS_APART * 86400
+    cache: dict[tuple, tuple | None] = {}
+
+    for n, k in enumerate(kalshi):
+        if n and n % 10000 == 0:
+            print(f"  matched {n}/{len(kalshi)} Kalshi markets...", flush=True)
+        if k.close:
+            t = k.close.timestamp()
+            lo, hi = bisect.bisect_left(times, t - window), bisect.bisect_right(times, t + window)
+            idx = [i for _, i in dated[lo:hi]] + undated
+        else:
+            idx = list(range(len(poly)))
         if not idx:
             continue
-        choices = {i: poly_names[i] for i in idx}
-        best = process.extractOne(norm(k.title), choices, scorer=fuzz.token_set_ratio,
-                                  score_cutoff=MIN_MATCH_SCORE)
-        if best:
-            _, score, i = best
-            yield k, poly[i], score
+        # Many Kalshi markets share a title (e.g. strike ladders) -- only score each once
+        ck = (norm(k.title), idx[0], idx[-1], len(idx))
+        if ck not in cache:
+            best = process.extractOne(ck[0], {i: names[i] for i in idx},
+                                      scorer=fuzz.token_set_ratio, score_cutoff=MIN_MATCH_SCORE)
+            cache[ck] = (best[2], best[1]) if best else None
+        hit = cache[ck]
+        if hit:
+            yield k, poly[hit[0]], hit[1]
 
 
 # ---------------------------------------------------------------- pricing
@@ -389,6 +406,7 @@ def format_opp(o: Opp) -> tuple[str, str]:
 # ---------------------------------------------------------------- main
 
 def main():
+    sys.stdout.reconfigure(line_buffering=True)  # show log lines live in GitHub
     if os.getenv("TEST_ALERT") == "1":
         send("Arb scanner test", "If you can read this on your phone, alerts work.")
         print("test alert sent" if NTFY_TOPIC else "NTFY_TOPIC not set; printed instead")
