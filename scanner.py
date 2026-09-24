@@ -143,7 +143,7 @@ def fetch_kalshi() -> list[Quote]:
             params["cursor"] = cursor
         data = get_json(f"{KALSHI_BASE}/events", params)
         for ev in data.get("events", []):
-            if SAMPLE_MODE and len(KALSHI_SAMPLES) < 400:
+            if SAMPLE_MODE and (len(KALSHI_SAMPLES) < 400 or "GAME" in (ev.get("series_ticker") or "")):
                 KALSHI_SAMPLES.append(ev)
             for m in ev.get("markets") or []:
                 q = kalshi_quote(m, ev)
@@ -198,7 +198,7 @@ def fetch_poly() -> list[Quote]:
                         {"limit": limit, "offset": offset, "active": "true", "closed": "false"})
         markets = data.get("markets", []) if isinstance(data, dict) else data
         for m in markets:
-            if SAMPLE_MODE and len(POLY_SAMPLES) < 3000:
+            if SAMPLE_MODE:
                 POLY_SAMPLES.append(m)
             q = poly_quote(m)
             if q:
@@ -435,19 +435,32 @@ def send(title: str, body: str, url: str = "", priority: str = "default"):
 
 
 def format_opp(o: Opp) -> tuple[str, str]:
+    """
+    Phone notification layout:
+      title:  1.1¢ / contract | 5% / yr | 72 days
+      body:   <name of trade>
+              (blank line)
+              Kalshi - NO - $0.82
+              <Kalshi ticker>
+              (blank line)
+              Polymarket - YES - $0.15
+              <Polymarket slug>
+    """
     ann = o.annualized
-    ann_txt = f" (~{ann:.0%}/yr)" if ann is not None and ann < 50 else ""
-    days_txt = f"{o.days:.1f} days" if o.days is not None else "unknown"
-    title = f"Arb {o.edge*100:.1f}¢/contract{ann_txt}"
+    ann_txt = f"{ann:.0%} / yr" if ann is not None and ann < 50 else "n/a / yr"
+    days_txt = f"{o.days:.0f} days" if o.days is not None else "? days"
+    title = f"{o.edge * 100:.1f}¢ / contract | {ann_txt} | {days_txt}"
     body = (
-        f"BUY Kalshi {o.k_side} @ {o.k_price:.2f}\n"
-        f"  {o.k.title}\n  [{o.k.id}]\n"
-        f"BUY Polymarket {o.p_side} @ {o.p_price:.2f}\n"
-        f"  {o.p.title}\n  [{o.p.id}]\n"
-        f"Cost {o.cost:.3f} + fees {o.fees:.3f} -> net {o.edge:.3f} per $1\n"
-        f"Resolves in {days_txt} | title match {o.score:.0f}/100\n"
-        f"CHECK BOTH RULEBOOKS MATCH BEFORE TRADING.\n"
-        f"Kalshi: {o.k.url}"
+        f"{o.k.title}\n"
+        f"\n"
+        f"Kalshi - {o.k_side} - ${o.k_price:.2f}\n"
+        f"{o.k.id}\n"
+        f"\n"
+        f"Polymarket - {o.p_side} - ${o.p_price:.2f}\n"
+        f"{o.p.id}\n"
+        f"\n"
+        f"Title match: {o.score:.0f}%\n"
+        f"Check both rulebooks match before trading."
     )
     return title, body
 
@@ -466,10 +479,9 @@ def print_samples():
         t = parse_time(ts)
         return t is not None and (t - now).total_seconds() < days * 86400
 
-    games = [e for e in KALSHI_SAMPLES if (e.get("category") or "").lower() == "sports"
-             and any(soon(m.get("expected_expiration_time") or m.get("close_time"))
-                     for m in e.get("markets") or [])]
-    print(f"\n-- Kalshi sports events settling within 10 days ({len(games)}) --")
+    games = [e for e in KALSHI_SAMPLES if "GAME" in (e.get("series_ticker") or "")]
+    print(f"\nKalshi game series: {dict(Counter(e.get('series_ticker') for e in games).most_common(20))}")
+    print(f"\n-- Kalshi game events ({len(games)}) --")
     for e in games[:20]:
         print(f"  {e.get('event_ticker')} | {e.get('title')!r} | sub={e.get('sub_title')!r}")
         for m in (e.get("markets") or [])[:3]:
@@ -478,8 +490,9 @@ def print_samples():
 
     types = Counter(str(m.get("sportsMarketTypeV2") or m.get("sportsMarketType")) for m in POLY_SAMPLES)
     print("\nPolymarket US sports market types:", dict(types.most_common(15)))
-    pgames = [m for m in POLY_SAMPLES if m.get("gameStartTime")]
-    print(f"\n-- Polymarket US markets with a game start time ({len(pgames)}) --")
+    pgames = [m for m in POLY_SAMPLES
+              if "FUTURE" not in str(m.get("sportsMarketTypeV2") or m.get("sportsMarketType") or "FUTURE")]
+    print(f"\n-- Polymarket US non-futures sports markets ({len(pgames)}) --")
     for m in pgames[:20]:
         sides = [(sd.get("description"), sd.get("long"), sd.get("teamId"))
                  for sd in (m.get("marketSides") or []) if isinstance(sd, dict)]
