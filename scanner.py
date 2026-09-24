@@ -32,7 +32,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 from rapidfuzz import fuzz, process
@@ -130,6 +130,10 @@ class Quote:
     url: str = ""
     sides: list[str] = field(default_factory=list)  # [YES label, NO label] if known
     base: str = ""        # title without the outcome label appended
+    # Individual games (matched by team names + start time instead of titles)
+    teams: list[str] = field(default_factory=list)
+    game_time: datetime | None = None
+    drawable: bool = False  # soccer-style: YES = one named team wins, a draw is possible
 
 
 # ---------------------------------------------------------------- Kalshi
@@ -143,11 +147,15 @@ def fetch_kalshi() -> list[Quote]:
             params["cursor"] = cursor
         data = get_json(f"{KALSHI_BASE}/events", params)
         for ev in data.get("events", []):
-            if SAMPLE_MODE and (len(KALSHI_SAMPLES) < 400 or "GAME" in (ev.get("series_ticker") or "")):
+            game = is_kalshi_game(ev)
+            if SAMPLE_MODE and (len(KALSHI_SAMPLES) < 400 or game):
                 KALSHI_SAMPLES.append(ev)
+            teams = kalshi_teams(ev) if game else []
             for m in ev.get("markets") or []:
                 q = kalshi_quote(m, ev)
                 if q:
+                    if len(teams) == 2:
+                        q.teams, q.game_time = teams, q.close
                     out.append(q)
         cursor = data.get("cursor") or ""
         pages += 1
@@ -156,6 +164,24 @@ def fetch_kalshi() -> list[Quote]:
         if not cursor or pages >= 500:
             break
     return out
+
+
+DRAW_WORDS = {"tie", "draw", "tie game"}
+
+
+def is_kalshi_game(ev: dict) -> bool:
+    # Single-game series look like KXNFLGAME, KXMLBGAME, KXNCAAFGAME (not KXGAMEAWARDS)
+    return bool(re.search(r"GAME$", ev.get("series_ticker") or ""))
+
+
+def kalshi_teams(ev: dict) -> list[str]:
+    """Kalshi game events have one market per team; the YES label is the team name."""
+    names = []
+    for m in ev.get("markets") or []:
+        lbl = (m.get("yes_sub_title") or "").strip()
+        if lbl and norm(lbl) not in DRAW_WORDS and lbl not in names:
+            names.append(lbl)
+    return names
 
 
 def kalshi_quote(m: dict, ev: dict | None = None) -> Quote | None:
@@ -258,7 +284,7 @@ def poly_quote(m: dict) -> Quote | None:
             no_lbl = no_lbl or lbl
 
     slug = m.get("slug") or str(m.get("id"))
-    return Quote(
+    q = Quote(
         platform="Polymarket US",
         id=slug,
         title=poly_title(m, slug),
@@ -268,6 +294,20 @@ def poly_quote(m: dict) -> Quote | None:
         url=f"https://polymarket.us/market/{slug}",
         sides=[yes_lbl, no_lbl],
     )
+
+    # Individual games: moneylines (two named sides) and soccer-style "Will A win against B"
+    mtype = str(m.get("sportsMarketTypeV2") or m.get("sportsMarketType") or "")
+    start = parse_time(m.get("gameStartTime"))
+    if start and "MONEYLINE" in mtype and yes_lbl and no_lbl and norm(yes_lbl) not in GENERIC_LABELS:
+        q.teams, q.game_time = [yes_lbl, no_lbl], start
+    elif start and "DRAWABLE" in mtype:
+        hit = re.search(r"will (.+?) win against (.+?) in ", m.get("question") or "", re.I)
+        if hit:
+            q.teams, q.game_time, q.drawable = [hit.group(1), hit.group(2)], start, True
+            q.sides = [hit.group(1), f"not {hit.group(1)}"]
+    if q.game_time:
+        q.close = q.game_time + timedelta(hours=4)  # pays out right after the game, not at endDate
+    return q
 
 
 # ---------------------------------------------------------------- matching
@@ -315,6 +355,49 @@ def similarity(a: str, b: str, **kwargs) -> float:
     so we blend in token_sort, which punishes big length differences.
     """
     return (fuzz.token_set_ratio(a, b) + fuzz.token_sort_ratio(a, b)) / 2
+
+
+def team_score(a: str, b: str) -> float:
+    return fuzz.token_set_ratio(norm(a), norm(b))
+
+
+def match_games(kalshi: list[Quote], poly: list[Quote]):
+    """
+    Pair single-game markets by BOTH team names and start time. Titles are useless here
+    (Kalshi: "Los Angeles L", Polymarket: "Los Angeles Lakers"), so we compare each
+    team name separately and require both to line up.
+    Yields (kalshi, poly, score, orientation).
+    """
+    import bisect
+    pg = sorted((p.game_time.timestamp(), i) for i, p in enumerate(poly))
+    times = [t for t, _ in pg]
+    for k in kalshi:
+        if not k.game_time:
+            continue
+        t = k.game_time.timestamp()
+        # Kalshi's expected settlement is a few hours to a few days after the game starts
+        lo = bisect.bisect_left(times, t - 4 * 86400)
+        hi = bisect.bisect_right(times, t + 86400)
+        best, best_score = None, 0.0
+        for _, i in pg[lo:hi]:
+            p = poly[i]
+            k1, k2 = k.teams
+            p1, p2 = p.teams
+            straight = min(team_score(k1, p1), team_score(k2, p2))
+            crossed = min(team_score(k1, p2), team_score(k2, p1))
+            sc = max(straight, crossed)
+            if sc > best_score and abs(straight - crossed) >= 15:
+                best, best_score = p, sc
+        if not best or best_score < MIN_MATCH_SCORE:
+            continue
+        # Which Polymarket side is the team this Kalshi market's YES is on?
+        k_yes = k.sides[0]
+        s_yes, s_other = team_score(k_yes, best.teams[0]), team_score(k_yes, best.teams[1])
+        if s_yes >= MIN_MATCH_SCORE and s_yes > s_other + 15:
+            yield k, best, best_score, 1
+        elif s_other >= MIN_MATCH_SCORE and s_other > s_yes + 15 and not best.drawable:
+            # moneyline: Kalshi "B wins" == Polymarket NO on "A wins" (no draws possible)
+            yield k, best, best_score, -1
 
 
 def match(kalshi: list[Quote], poly: list[Quote]):
@@ -374,8 +457,9 @@ class Opp:
         return (1 + self.edge / self.cost) ** (365 / max(self.days, 1)) - 1
 
 
-def price_pair(k: Quote, p: Quote, score: float) -> list[Opp]:
-    orient = orientation(k, p)
+def price_pair(k: Quote, p: Quote, score: float, orient: int | None = None) -> list[Opp]:
+    if orient is None:
+        orient = orientation(k, p)
     if orient == 0:
         return []
     # p_yes/p_no expressed in terms of the *Kalshi* YES outcome
@@ -434,6 +518,13 @@ def send(title: str, body: str, url: str = "", priority: str = "default"):
         print(f"  ntfy send failed: {e}")
 
 
+def side_text(side: str, subject: str) -> str:
+    """'YES on Kansas City' -- names what the YES/NO is about when it's a team or outcome."""
+    if subject and norm(subject) not in GENERIC_LABELS:
+        return f"{side} on {subject}"
+    return side
+
+
 def format_opp(o: Opp) -> tuple[str, str]:
     """
     Phone notification layout:
@@ -453,10 +544,10 @@ def format_opp(o: Opp) -> tuple[str, str]:
     body = (
         f"{o.k.title}\n"
         f"\n"
-        f"Kalshi - {o.k_side} - ${o.k_price:.2f}\n"
+        f"Kalshi - {side_text(o.k_side, o.k.sides[0] if o.k.sides else '')} - ${o.k_price:.2f}\n"
         f"{o.k.id}\n"
         f"\n"
-        f"Polymarket - {o.p_side} - ${o.p_price:.2f}\n"
+        f"Polymarket - {side_text(o.p_side, o.p.sides[0] if o.p.teams and o.p.sides else '')} - ${o.p_price:.2f}\n"
         f"{o.p.id}\n"
         f"\n"
         f"Title match: {o.score:.0f}%\n"
@@ -479,10 +570,10 @@ def print_samples():
         t = parse_time(ts)
         return t is not None and (t - now).total_seconds() < days * 86400
 
-    games = [e for e in KALSHI_SAMPLES if "GAME" in (e.get("series_ticker") or "")]
+    games = [e for e in KALSHI_SAMPLES if is_kalshi_game(e)]
     print(f"\nKalshi game series: {dict(Counter(e.get('series_ticker') for e in games).most_common(20))}")
     print(f"\n-- Kalshi game events ({len(games)}) --")
-    for e in games[:20]:
+    for e in games[:12]:
         print(f"  {e.get('event_ticker')} | {e.get('title')!r} | sub={e.get('sub_title')!r}")
         for m in (e.get("markets") or [])[:3]:
             print(f"      {m.get('ticker')} yes={m.get('yes_sub_title')!r} "
@@ -491,9 +582,9 @@ def print_samples():
     types = Counter(str(m.get("sportsMarketTypeV2") or m.get("sportsMarketType")) for m in POLY_SAMPLES)
     print("\nPolymarket US sports market types:", dict(types.most_common(15)))
     pgames = [m for m in POLY_SAMPLES
-              if "FUTURE" not in str(m.get("sportsMarketTypeV2") or m.get("sportsMarketType") or "FUTURE")]
-    print(f"\n-- Polymarket US non-futures sports markets ({len(pgames)}) --")
-    for m in pgames[:20]:
+              if re.search("MONEYLINE|DRAWABLE", str(m.get("sportsMarketTypeV2") or m.get("sportsMarketType")))]
+    print(f"\n-- Polymarket US moneyline / match-winner markets ({len(pgames)}) --")
+    for m in pgames[:12]:
         sides = [(sd.get("description"), sd.get("long"), sd.get("teamId"))
                  for sd in (m.get("marketSides") or []) if isinstance(sd, dict)]
         print(f"  {m.get('slug')} | type={m.get('sportsMarketTypeV2') or m.get('sportsMarketType')}")
@@ -528,10 +619,22 @@ def main():
     if SAMPLE_MODE:
         print_samples()
 
-    pairs = list(match(kalshi, poly))
-    print(f"Matched {len(pairs)} candidate pairs")
+    k_games = [q for q in kalshi if q.game_time]
+    p_games = [q for q in poly if q.game_time]
+    print(f"Games: {len(k_games)} Kalshi team markets, {len(p_games)} Polymarket US game markets")
+    game_pairs = list(match_games(k_games, p_games))
+    print(f"Matched {len(game_pairs)} game pairs")
+    if SAMPLE_MODE:
+        for k, p, sc, o in game_pairs[:25]:
+            print(f"  GAME {k.id} yes={k.sides[0]!r} {k.teams} <-> {p.id} {p.teams} "
+                  f"({sc:.0f}, {'same' if o == 1 else 'opposite'} side)")
 
-    all_opps = [o for k, p, s in pairs for o in price_pair(k, p, s)]
+    other_pairs = [(k, p, s, None) for k, p, s in match(
+        [q for q in kalshi if not q.game_time], [q for q in poly if not q.game_time])]
+    print(f"Matched {len(other_pairs)} other pairs")
+    pairs = game_pairs + other_pairs
+
+    all_opps = [o for k, p, s, orient in pairs for o in price_pair(k, p, s, orient)]
     all_opps.sort(key=lambda o: -o.edge)
 
     print("\nTop 10 closest-to-arb pairs this run:")
