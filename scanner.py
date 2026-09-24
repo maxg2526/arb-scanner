@@ -680,6 +680,11 @@ def main():
     if SAMPLE_MODE:
         print_samples()
 
+    state = load_state()
+    sent = 0
+
+    # 1) Fights/games first: they match in seconds and their gaps close fastest,
+    #    so alert on them before the slower futures matching even starts.
     k_games = [q for q in kalshi if q.game_time]
     p_games = [q for q in poly if q.game_time]
     print(f"Games: {len(k_games)} Kalshi team markets, {len(p_games)} Polymarket US game markets")
@@ -689,23 +694,56 @@ def main():
         for k, p, sc, o in game_pairs[:25]:
             print(f"  GAME {k.id} yes={k.sides[0]!r} {k.teams} <-> {p.id} {p.teams} "
                   f"({sc:.0f}, {'same' if o == 1 else 'opposite'} side)")
+    game_opps = [o for k, p, s, orient in game_pairs for o in price_pair(k, p, s, orient)]
+    sent += alert(game_opps, state)
+    save_state(state)  # saved right away so a later crash can't cause repeat alerts
 
+    # 2) Futures, elections, everything else
     other_pairs = [(k, p, s, None) for k, p, s in match(
         [q for q in kalshi if not q.game_time], [q for q in poly if not q.game_time])]
     print(f"Matched {len(other_pairs)} other pairs")
-    pairs = game_pairs + other_pairs
+    other_opps = [o for k, p, s, orient in other_pairs for o in price_pair(k, p, s, orient)]
+    sent += alert(other_opps, state)
+    save_state(state)
 
-    all_opps = [o for k, p, s, orient in pairs for o in price_pair(k, p, s, orient)]
-    all_opps.sort(key=lambda o: -o.edge)
-
+    all_opps = sorted(game_opps + other_opps, key=lambda o: -o.edge)
     print("\nTop 10 closest-to-arb pairs this run:")
     for o in all_opps[:10]:
         print(f"  net {o.edge:+.3f} | K {o.k_side} {o.k_price:.2f} + P {o.p_side} {o.p_price:.2f}"
               f" | {o.k.title[:45]!r} <-> {o.p.title[:45]!r} ({o.score:.0f})")
+    print(f"\nSent {sent} new alert(s). Took {time.time() - t0:.0f}s.")
 
-    state = load_state()
+
+def refresh(o: Opp) -> bool | None:
+    """
+    Re-price both legs from live quotes right before alerting (the bulk download can be
+    a few minutes old by now). Returns True if the arb still clears MIN_EDGE, False if
+    it's gone, None if the recheck itself failed.
+    """
+    try:
+        km = get_json(f"{KALSHI_BASE}/markets/{o.k.id}", tries=2).get("market") or {}
+        kp = num(km.get("yes_ask_dollars" if o.k_side == "YES" else "no_ask_dollars"))
+        bbo = get_json(f"{POLY_BASE}/v1/markets/{o.p.id}/bbo", tries=2).get("marketData") or {}
+        if o.p_side == "YES":
+            pp = num(bbo.get("bestAsk"))
+        else:
+            bid = num(bbo.get("bestBid"))
+            pp = 1 - bid if bid else None
+    except Exception as e:
+        print(f"  recheck failed for {o.k.id}: {e}")
+        return None
+    if not kp or not pp or not (0 < kp < 1) or not (0 < pp < 1):
+        return False
+    o.k_price, o.p_price = kp, pp
+    o.cost = kp + pp
+    o.fees = taker_fee(KALSHI_FEE_COEF, kp) + taker_fee(POLY_FEE_COEF, pp)
+    o.edge = 1 - o.cost - o.fees
+    return o.edge >= MIN_EDGE
+
+
+def alert(opps: list[Opp], state: dict) -> int:
     sent = 0
-    for o in all_opps:
+    for o in sorted(opps, key=lambda o: -o.edge):
         if o.edge < MIN_EDGE:
             break
         if o.edge > MAX_EDGE:
@@ -716,14 +754,18 @@ def main():
         # re-alert only if the edge improved by at least 1 cent
         if prev and o.edge < prev["edge"] + 0.01:
             continue
+        live = None if DRY_RUN else refresh(o)
+        if live is False:
+            print(f"  gone on recheck: {o.k.id} <-> {o.p.id}")
+            continue
         o.p.url = poly_event_url(o.p.id)
         title, body = format_opp(o)
+        if live is None and not DRY_RUN:
+            body += "\n(Couldn't recheck live prices -- verify before trading.)"
         send(title, body, o.k.url, "high" if o.edge >= 0.03 else "default", o.p.url)
         state[o.key] = {"edge": o.edge, "t": time.time()}
         sent += 1
-
-    save_state(state)
-    print(f"\nSent {sent} new alert(s). Took {time.time() - t0:.0f}s.")
+    return sent
 
 
 if __name__ == "__main__":
