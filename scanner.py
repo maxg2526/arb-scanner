@@ -1,5 +1,5 @@
 """
-Kalshi <-> Polymarket US arbitrage scanner.
+Kalshi <-> Polymarket US <-> Novig arbitrage scanner.
 
 Each run:
   1. Pulls open markets from Kalshi and Polymarket US (public data, no login needed).
@@ -21,6 +21,8 @@ Settings come from environment variables (set in the GitHub workflow):
   STATE_FILE        where already-alerted opportunities are remembered (default state/alerted.json)
   TEST_ALERT=1      just send a test notification and exit
   DRY_RUN=1         print alerts instead of sending them
+  NOVIG_KEY_ID      Novig read key id (optional -- Novig is skipped without it)
+  NOVIG_PRIVATE_KEY Novig read key, PEM text (optional)
 """
 
 from __future__ import annotations
@@ -39,10 +41,14 @@ from rapidfuzz import fuzz, process
 
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 POLY_BASE = "https://gateway.polymarket.us"
+NOVIG_BASE = "https://api.novig.com"
+NOVIG_KEY_ID = os.getenv("NOVIG_KEY_ID", "").strip()
+NOVIG_PRIVATE_KEY = os.getenv("NOVIG_PRIVATE_KEY", "").strip()
 
 # Taker fee coefficients: fee per contract ~= COEF * p * (1 - p)
 KALSHI_FEE_COEF = 0.07     # Kalshi general taker fee (rounded UP to the cent per order)
 POLY_FEE_COEF = 0.0695     # Polymarket US taker fee (in effect since Sept 17, 2026)
+NOVIG_FEE_COEF = 0.03      # Novig game-market taker fee (0.06 on futures); often 0 before a game starts
 
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.01"))
 MAX_EDGE = float(os.getenv("MAX_EDGE", "0.08"))
@@ -58,6 +64,7 @@ DRY_RUN = os.getenv("DRY_RUN") == "1"
 SAMPLE_MODE = os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch" or os.getenv("SAMPLES") == "1"
 KALSHI_SAMPLES: list[dict] = []
 POLY_SAMPLES: list[dict] = []
+NOVIG_SAMPLES: list[dict] = []
 
 session = requests.Session()
 session.headers["User-Agent"] = "arb-scanner/1.0"
@@ -136,6 +143,8 @@ class Quote:
     teams: list[str] = field(default_factory=list)
     game_time: datetime | None = None
     drawable: bool = False  # soccer-style: YES = one named team wins, a draw is possible
+    fee_coef: float = KALSHI_FEE_COEF
+    extra: dict = field(default_factory=dict)  # platform-specific ids for live rechecks
 
 
 # ---------------------------------------------------------------- Kalshi
@@ -342,6 +351,7 @@ def poly_quote(m: dict) -> Quote | None:
         no_ask=no_ask,
         url=f"https://polymarket.us/market/{slug}",
         sides=[yes_lbl, no_lbl],
+        fee_coef=POLY_FEE_COEF,
     )
 
     # Individual games: moneylines (two named sides) and soccer-style "Will A win against B"
@@ -357,6 +367,133 @@ def poly_quote(m: dict) -> Quote | None:
     if q.game_time:
         q.close = q.game_time + timedelta(hours=4)  # pays out right after the game, not at endDate
     return q
+
+
+# ---------------------------------------------------------------- Novig
+
+_novig_key = None
+
+
+def novig_get(path: str, query: dict | None = None) -> dict:
+    """Signed GET to Novig (every Novig request, even reading prices, must be signed)."""
+    global _novig_key
+    import base64, hashlib
+    from urllib.parse import urlencode
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key
+    if _novig_key is None:
+        _novig_key = load_pem_private_key(NOVIG_PRIVATE_KEY.replace("\\n", "\n").encode(), None)
+    qs = urlencode({k: v for k, v in (query or {}).items() if v is not None})
+    for i in range(4):
+        ts = str(int(time.time() * 1000))
+        text = "\n".join(["NOVIG-V3", ts, "GET", path, qs, hashlib.sha256(b"").hexdigest()])
+        sig = base64.b64encode(_novig_key.sign(text.encode())).decode()
+        r = session.get(NOVIG_BASE + path + (f"?{qs}" if qs else ""), timeout=30, headers={
+            "Novig-Key-Id": NOVIG_KEY_ID, "Novig-Timestamp": ts, "Novig-Signature": sig})
+        if r.status_code == 429:
+            time.sleep(float(r.headers.get("Retry-After", "1")))
+            continue
+        r.raise_for_status()
+        return r.json()
+    r.raise_for_status()
+    return {}
+
+
+def novig_book(market_id: str) -> dict:
+    return novig_get(f"/v3/catalog/markets/{market_id}/book").get("orders") or {}
+
+
+def novig_take(book: dict, resting_outcome: str) -> tuple[float | None, float | None]:
+    """
+    Every Novig order is a *buy* of one outcome. So the cheapest way to buy outcome A
+    right now is to match the best resting buy on outcome B: you pay 1 - B's price.
+    Novig contracts pay 1 cent, so 100 of them = one $1 contract on Kalshi/Polymarket.
+    """
+    orders = book.get(resting_outcome) or []
+    if not orders:
+        return None, None
+    best = num(orders[0].get("price"))
+    if best is None:
+        return None, None
+    qty = sum(o.get("qty", 0) for o in orders if num(o.get("price")) == best)
+    return 1 - best, qty / 100
+
+
+HOME_AWAY = {"home", "away", "home team", "away team"}
+
+
+def novig_teams(m: dict) -> list[str]:
+    names = [str(o.get("name") or "").strip() for o in m.get("outcomes") or []]
+    if len(names) == 2 and all(n and n.lower() not in HOME_AWAY for n in names):
+        return names
+    # Outcomes may be generic ("Home"/"Away"); take team names from "Away @ Home" text.
+    # Only "@"/"at" says which side is home -- "A vs B" is ambiguous, so skip those
+    # rather than risk flipping the teams (that would create fake arbs).
+    hit = re.search(r"(.+?)\s+(?:@|at)\s+(.+)", m.get("description") or "", re.I)
+    if hit and len(names) == 2:
+        away, home = hit.group(1).strip(), hit.group(2).strip()
+        return [home if n.lower().startswith("home") else away for n in names]
+    return []
+
+
+def fetch_novig() -> list[Quote]:
+    if not (NOVIG_KEY_ID and NOVIG_PRIVATE_KEY):
+        print("  (no Novig key set -- skipping Novig)")
+        return []
+    now_ms = int(time.time() * 1000)
+    markets, after = [], None
+    while True:
+        data = novig_get("/v3/catalog/markets", {
+            "limit": 5000, "after": after,
+            "startsAfter": now_ms - 6 * 3600 * 1000,          # includes games in progress
+            "startsBefore": now_ms + 10 * 86400 * 1000})
+        markets += data.get("items") or []
+        after = data.get("next")
+        if not after:
+            break
+    if SAMPLE_MODE:
+        NOVIG_SAMPLES.extend(markets[:400])
+        from collections import Counter
+        print("  Novig market types:", dict(Counter(m.get("marketType") for m in markets).most_common(15)))
+
+    out = []
+    for m in markets:
+        mtype = str(m.get("marketType") or "").upper()
+        outs = m.get("outcomes") or []
+        if m.get("status") != "OPEN" or "MONEY" not in mtype or "3_WAY" in mtype or len(outs) != 2:
+            continue
+        teams = novig_teams(m)
+        if len(teams) != 2:
+            continue
+        try:
+            book = novig_book(m["marketId"])
+        except Exception as e:
+            print(f"  Novig book failed for {m.get('marketId')}: {e}")
+            continue
+        a, b = outs[0]["outcomeId"], outs[1]["outcomeId"]
+        buy_a, size_a = novig_take(book, b)
+        buy_b, size_b = novig_take(book, a)
+        if buy_a is None and buy_b is None:
+            continue
+        fee = m.get("fee") or {}
+        coef = num(fee.get("coefficient"))
+        coef = NOVIG_FEE_COEF if coef is None else coef
+        if fee.get("charged") is False:
+            coef = 0.0
+        start = datetime.fromtimestamp(m["startsTs"] / 1000, tz=timezone.utc) if m.get("startsTs") else None
+        out.append(Quote(
+            platform="Novig",
+            id=m["marketId"],
+            title=m.get("description") or " vs ".join(teams),
+            close=(start + timedelta(hours=4)) if start else None,
+            yes_ask=buy_a, no_ask=buy_b,                 # "YES" = outcome A, "NO" = outcome B
+            yes_ask_size=size_a, no_ask_size=size_b,
+            url="https://novig.com",
+            sides=teams, teams=teams, game_time=start,
+            fee_coef=coef,
+            extra={"outcomes": [a, b]},
+        ))
+        time.sleep(0.03)  # stay well under Novig's 50 requests/second
+    return out
 
 
 # ---------------------------------------------------------------- matching
@@ -527,14 +664,15 @@ def price_pair(k: Quote, p: Quote, score: float, orient: int | None = None) -> l
     for k_side, kp, p_side, pp in combos:
         if kp is None or pp is None:
             continue
-        if k_side == "YES" and k.yes_ask_size is not None and k.yes_ask_size < MIN_SIZE:
+        ks = k.yes_ask_size if k_side == "YES" else k.no_ask_size
+        ps = p.yes_ask_size if p_side == "YES" else p.no_ask_size
+        if any(x is not None and x < MIN_SIZE for x in (ks, ps)):
             continue
-        fees = taker_fee(KALSHI_FEE_COEF, kp) + taker_fee(POLY_FEE_COEF, pp)
+        fees = taker_fee(k.fee_coef, kp) + taker_fee(p.fee_coef, pp)
         cost = kp + pp
         edge = 1 - cost - fees
         opps.append(Opp(f"{k.id}|{p.id}|{k_side}", k, p, score, k_side, p_side,
-                        kp, pp, cost, fees, edge, days,
-                        k_size=k.yes_ask_size if k_side == "YES" else None))
+                        kp, pp, cost, fees, edge, days, k_size=ks, p_size=ps))
     return opps
 
 
@@ -594,20 +732,37 @@ def size_lines(o: Opp) -> str:
     $500 budget: 120 contracts each side (capped by available size)
     """
     per = o.cost + o.fees  # all-in cost of one contract on each side
-    lines = [f"Available: {fmt_count(o.k_size)} on Kalshi, "
-             f"{fmt_count(o.p_size, approx=True)} on Polymarket"]
+    lines = [f"Available: {fmt_count(o.k_size, approx=o.k.platform == 'Polymarket US')} on {short(o.k)}, "
+             f"{fmt_count(o.p_size, approx=o.p.platform == 'Polymarket US')} on {short(o.p)}"]
     known = [x for x in (o.k_size, o.p_size) if x is not None]
     max_n = int(min(known)) if known else None
     if max_n is not None:
         lines.append(f"Max size at these prices: {max_n:,} contracts "
                      f"(~${max_n * per:,.0f} in, ~${max_n * o.edge:,.2f} profit)")
     want = int(BUDGET // per) if per > 0 else 0
+    n = want
     if max_n is not None and max_n < want:
-        lines.append(f"${BUDGET:,.0f} budget: {max_n:,} contracts each side (capped by available size)")
+        n = max_n
+        lines.append(f"${BUDGET:,.0f} budget: {n:,} contracts each side (capped by available size)")
     else:
-        lines.append(f"${BUDGET:,.0f} budget: {want:,} contracts each side "
-                     f"(~${want * o.edge:,.2f} profit)")
+        lines.append(f"${BUDGET:,.0f} budget: {n:,} contracts each side "
+                     f"(~${n * o.edge:,.2f} profit)")
+    # Dollar amounts too -- some apps (Novig) take a dollar amount rather than a count
+    lines.append(f"Spend: ${n * o.k_price:,.2f} on {short(o.k)}, ${n * o.p_price:,.2f} on {short(o.p)} "
+                 f"(pays ${n:,} either way)")
     return "\n".join(lines)
+
+
+def short(q: Quote) -> str:
+    return "Polymarket" if q.platform == "Polymarket US" else q.platform
+
+
+def leg_text(q: Quote, side: str) -> str:
+    if q.platform == "Novig":  # Novig has no YES/NO -- you buy one of the outcomes
+        return f"BUY {q.sides[0] if side == 'YES' else q.sides[1]}"
+    if q.platform == "Kalshi":
+        return side_text(side, q.sides[0] if q.sides else "")
+    return side_text(side, q.sides[0] if q.teams and q.sides else "")
 
 
 def grade(o: Opp) -> str:
@@ -644,10 +799,10 @@ def format_opp(o: Opp) -> tuple[str, str]:
     body = (
         f"{o.k.title}\n"
         f"\n"
-        f"Kalshi - {side_text(o.k_side, o.k.sides[0] if o.k.sides else '')} - ${o.k_price:.2f}\n"
+        f"{short(o.k)} - {leg_text(o.k, o.k_side)} - ${o.k_price:.2f}\n"
         f"{o.k.id}\n"
         f"\n"
-        f"Polymarket - {side_text(o.p_side, o.p.sides[0] if o.p.teams and o.p.sides else '')} - ${o.p_price:.2f}\n"
+        f"{short(o.p)} - {leg_text(o.p, o.p_side)} - ${o.p_price:.2f}\n"
         f"{o.p.id}\n"
         f"\n"
         f"{size_lines(o)}\n"
@@ -655,8 +810,8 @@ def format_opp(o: Opp) -> tuple[str, str]:
         f"Title match: {o.score:.0f}%\n"
         f"Check both rulebooks match before trading.\n"
         f"\n"
-        f"Kalshi: {o.k.url}\n"
-        f"Polymarket: {o.p.url}"
+        f"{short(o.k)}: {o.k.url}\n"
+        f"{short(o.p)}: {o.p.url}"
     )
     return title, body
 
@@ -708,6 +863,10 @@ def print_samples():
     for m in [m for m in POLY_SAMPLES if m.get("category") != "sports"][:10]:
         print(f"  {m.get('slug')} | q={m.get('question')!r} title={m.get('title')!r} "
               f"sub={m.get('subtitle')!r} end={m.get('endDate')}")
+    print(f"\n-- Novig markets ({len(NOVIG_SAMPLES)} sampled) --")
+    for m in NOVIG_SAMPLES[:15]:
+        print(f"  {m.get('marketType')} | {m.get('description')!r} | status={m.get('status')} "
+              f"| outcomes={[o.get('name') for o in m.get('outcomes') or []]} | fee={m.get('fee')}")
     print("================================================================\n")
 
 
@@ -727,6 +886,13 @@ def main():
     print("Fetching Polymarket US...")
     poly = fetch_poly()
     print(f"  {len(poly)} priced Polymarket US markets")
+    print("Fetching Novig...")
+    try:
+        novig = fetch_novig()
+    except Exception as e:  # Novig trouble shouldn't stop the Kalshi/Polymarket scan
+        print(f"  Novig failed: {e}")
+        novig = []
+    print(f"  {len(novig)} priced Novig game markets")
 
     if SAMPLE_MODE:
         print_samples()
@@ -740,10 +906,15 @@ def main():
     p_games = [q for q in poly if q.game_time]
     print(f"Games: {len(k_games)} Kalshi team markets, {len(p_games)} Polymarket US game markets")
     game_pairs = list(match_games(k_games, p_games))
-    print(f"Matched {len(game_pairs)} game pairs")
+    print(f"Matched {len(game_pairs)} Kalshi-Polymarket game pairs")
+    if novig:
+        kn = list(match_games(k_games, novig))
+        pn = list(match_games([q for q in p_games if not q.drawable], novig))
+        print(f"Matched {len(kn)} Kalshi-Novig and {len(pn)} Polymarket-Novig game pairs")
+        game_pairs += kn + pn
     if SAMPLE_MODE:
-        for k, p, sc, o in game_pairs[:25]:
-            print(f"  GAME {k.id} yes={k.sides[0]!r} {k.teams} <-> {p.id} {p.teams} "
+        for k, p, sc, o in game_pairs[:40]:
+            print(f"  GAME [{short(k)}-{short(p)}] {k.id} yes={k.sides[0]!r} {k.teams} <-> {p.id} {p.teams} "
                   f"({sc:.0f}, {'same' if o == 1 else 'opposite'} side)")
     game_opps = [o for k, p, s, orient in game_pairs for o in price_pair(k, p, s, orient)]
     sent += alert(game_opps, state)
@@ -765,6 +936,28 @@ def main():
     print(f"\nSent {sent} new alert(s). Took {time.time() - t0:.0f}s.")
 
 
+def live_leg(q: Quote, side: str) -> tuple[float | None, float | None]:
+    """Fresh (price, contracts available) for buying `side` of quote q, from that platform."""
+    if q.platform == "Kalshi":
+        km = get_json(f"{KALSHI_BASE}/markets/{q.id}", tries=2).get("market") or {}
+        price = num(km.get("yes_ask_dollars" if side == "YES" else "no_ask_dollars"))
+        # Buying NO on Kalshi fills against YES bids, so NO size = size at the best YES bid
+        size = num(km.get("yes_ask_size_fp" if side == "YES" else "yes_bid_size_fp"))
+        return price, size
+    if q.platform == "Polymarket US":
+        bbo = get_json(f"{POLY_BASE}/v1/markets/{q.id}/bbo", tries=2).get("marketData") or {}
+        if side == "YES":
+            return num(bbo.get("bestAsk")), num(bbo.get("askShares"))
+        bid = num(bbo.get("bestBid"))
+        return (1 - bid if bid else None), num(bbo.get("bidShares"))  # NO = sell into YES bids
+    if q.platform == "Novig":
+        book = novig_book(q.id)
+        a, b = q.extra["outcomes"]
+        # To buy outcome A you take a resting order on outcome B (and vice versa)
+        return novig_take(book, b if side == "YES" else a)
+    return None, None
+
+
 def refresh(o: Opp) -> bool | None:
     """
     Re-price both legs from live quotes right before alerting (the bulk download can be
@@ -772,18 +965,8 @@ def refresh(o: Opp) -> bool | None:
     it's gone, None if the recheck itself failed.
     """
     try:
-        km = get_json(f"{KALSHI_BASE}/markets/{o.k.id}", tries=2).get("market") or {}
-        kp = num(km.get("yes_ask_dollars" if o.k_side == "YES" else "no_ask_dollars"))
-        # Buying NO on Kalshi fills against YES bids, so NO size = size at the best YES bid
-        o.k_size = num(km.get("yes_ask_size_fp" if o.k_side == "YES" else "yes_bid_size_fp"))
-        bbo = get_json(f"{POLY_BASE}/v1/markets/{o.p.id}/bbo", tries=2).get("marketData") or {}
-        if o.p_side == "YES":
-            pp = num(bbo.get("bestAsk"))
-            o.p_size = num(bbo.get("askShares"))
-        else:
-            bid = num(bbo.get("bestBid"))
-            pp = 1 - bid if bid else None
-            o.p_size = num(bbo.get("bidShares"))  # buying NO = selling into YES bids
+        kp, o.k_size = live_leg(o.k, o.k_side)
+        pp, o.p_size = live_leg(o.p, o.p_side)
     except Exception as e:
         print(f"  recheck failed for {o.k.id}: {e}")
         return None
@@ -791,7 +974,7 @@ def refresh(o: Opp) -> bool | None:
         return False
     o.k_price, o.p_price = kp, pp
     o.cost = kp + pp
-    o.fees = taker_fee(KALSHI_FEE_COEF, kp) + taker_fee(POLY_FEE_COEF, pp)
+    o.fees = taker_fee(o.k.fee_coef, kp) + taker_fee(o.p.fee_coef, pp)
     o.edge = 1 - o.cost - o.fees
     return o.edge >= MIN_EDGE
 
@@ -813,7 +996,9 @@ def alert(opps: list[Opp], state: dict) -> int:
         if live is False:
             print(f"  gone on recheck: {o.k.id} <-> {o.p.id}")
             continue
-        o.p.url = poly_event_url(o.p.id)
+        for q in (o.k, o.p):
+            if q.platform == "Polymarket US" and "/event/" not in q.url:
+                q.url = poly_event_url(q.id)
         title, body = format_opp(o)
         if live is None and not DRY_RUN:
             body += "\n(Couldn't recheck live prices -- verify before trading.)"
